@@ -57,20 +57,9 @@ def _do_preprocess_event(cache_key, data, start_time, event_id, process_event):
         error_logger.error('preprocess.failed.empty', extra={'cache_key': cache_key})
         return
 
-    project = data['project']
-    Raven.tags_context({
-        'project': project,
-    })
-
-    if should_process(data):
-        process_event.delay(cache_key=cache_key, start_time=start_time, event_id=event_id)
-        return
-
-    # If we get here, that means the event had no preprocessing needed to be done
-    # so we can jump directly to save_event
-    if cache_key:
-        data = None
-    save_event.delay(cache_key=cache_key, data=data, start_time=start_time, event_id=event_id)
+    if isinstance(data, dict):
+        data = [data]
+    save_event(data=data, start_time=start_time)
 
 
 @instrumented_task(
@@ -142,7 +131,7 @@ def _do_process_event(cache_key, start_time, event_id):
 
         default_cache.set(cache_key, data, 3600)
 
-    save_event.delay(cache_key=cache_key, data=None, start_time=start_time, event_id=event_id)
+    save_event(cache_key=cache_key, data=None, start_time=start_time, event_id=event_id)
 
 
 @instrumented_task(
@@ -172,21 +161,6 @@ def delete_raw_event(project_id, event_id, allow_hint_clear=False):
     from sentry.models import RawEvent, ReprocessingReport
     RawEvent.objects.filter(project_id=project_id, event_id=event_id).delete()
     ReprocessingReport.objects.filter(project_id=project_id, event_id=event_id).delete()
-
-    # Clear the sent notification if we reprocessed everything
-    # successfully and reprocessing is enabled
-    reprocessing_active = ProjectOption.objects.get_value(
-        project_id, 'sentry:reprocessing_active', REPROCESSING_DEFAULT
-    )
-    if reprocessing_active:
-        sent_notification = ProjectOption.objects.get_value(
-            project_id, 'sentry:sent_failed_event_hint', False
-        )
-        if sent_notification:
-            if ReprocessingReport.objects.filter(
-                    project_id=project_id, event_id=event_id).exists():
-                project = Project.objects.get_from_cache(id=project_id)
-                ProjectOption.objects.set_value(project, 'sentry:sent_failed_event_hint', False)
 
 
 def create_failed_event(cache_key, project_id, issues, event_id, start_time=None):
@@ -258,20 +232,19 @@ def save_event(cache_key=None, data=None, start_time=None, event_id=None, **kwar
     from sentry.event_manager import HashDiscarded, EventManager
     from sentry import tsdb
 
-    if cache_key:
-        data = default_cache.get(cache_key)
-
-    if event_id is None and data is not None:
-        event_id = data['event_id']
-
     if data is None:
         metrics.incr('events.failed', tags={'reason': 'cache', 'stage': 'post'})
         return
 
-    project = data.pop('project')
+    project = None
+    if len(data) == 0:
+        return
 
-    delete_raw_event(project, event_id, allow_hint_clear=True)
-
+    for item in data:
+        event_id = item['event_id']
+        project = item.pop('project')
+        delete_raw_event(project, event_id, allow_hint_clear=True)
+    # All events are from the same project
     Raven.tags_context({
         'project': project,
     })
@@ -291,8 +264,3 @@ def save_event(cache_key=None, data=None, start_time=None, event_id=None, **kwar
     finally:
         if cache_key:
             default_cache.delete(cache_key)
-        if start_time:
-            metrics.timing(
-                'events.time-to-process',
-                time() - start_time,
-                instance=data['platform'])
