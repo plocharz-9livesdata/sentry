@@ -16,7 +16,7 @@ def ensure_release_exists(instance, created, **kwargs):
     if instance.data and instance.data.get('release_id'):
         return
 
-    project = Project.objects.get(pk=instance.project_id)
+    project = Project.objects.get_from_cache(pk=instance.project_id)
 
     try:
         with transaction.atomic():

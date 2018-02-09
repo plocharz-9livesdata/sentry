@@ -9,6 +9,10 @@ from __future__ import absolute_import, print_function
 
 import logging
 import math
+from contextlib import closing
+import csv
+from cStringIO import StringIO
+
 import six
 
 from datetime import datetime, timedelta
@@ -20,9 +24,11 @@ from django.utils.encoding import force_bytes, force_text
 from hashlib import md5
 from uuid import uuid4
 
+from sentry.utils.compat import pickle
+from sentry.utils.strings import compress
 from sentry import eventtypes, features, buffer, tagstore
-# we need a bunch of unexposed functions from tsdb
-from sentry.tsdb import backend as tsdb
+from sentry.tagstore.legacy.models.eventtag import EventTag
+
 from sentry.constants import (
     CLIENT_RESERVED_ATTRS, LOG_LEVELS, DEFAULT_LOGGER_NAME, MAX_CULPRIT_LENGTH
 )
@@ -33,9 +39,7 @@ from sentry.models import (
     UserReport
 )
 from sentry.plugins import plugins
-from sentry.signals import first_event_received, regression_signal
 from sentry.tasks.merge import merge_group
-from sentry.tasks.post_process import post_process_group
 from sentry.utils import metrics
 from sentry.utils.cache import default_cache
 from sentry.utils.db import get_db_engine
@@ -408,11 +412,109 @@ class EventManager(object):
         return data
 
     def save(self, project, raw=False):
-        from sentry.tasks.post_process import index_event_tags
+        import time
+        duration_start = time.time()
+        items = self.data
 
+        events = []
+
+        count = len(items)
+        for item in items:
+            data = item.copy()
+            events.append(self.save_item(data, project))
+
+        # EventMapping.objects.bulk_create([mapping for event, tags, mapping in events])
+
+        stream = StringIO()
+        writer = csv.writer(stream, delimiter='\t')
+
+        now__isoformat = timezone.now().isoformat()
+        for event, tags, mapping in events:
+            writer.writerow([mapping.project_id, mapping.group.id, mapping.event_id, now__isoformat])
+
+        with closing(connection.cursor()) as cursor:
+            stream.seek(0)
+            cursor.copy_from(
+                file=stream,
+                table=EventMapping._meta.db_table,
+                sep="\t",
+                columns=['project_id', 'group_id', 'event_id', 'date_added']
+            )
+
+        # Event.objects.bulk_create([event for event, tags, mapping in events])
+        stream = StringIO()
+        writer = csv.writer(stream, delimiter='\t')
+
+        for event, tags, mapping in events:
+            writer.writerow([event.group.id, event.project_id, event.event_id, compress(pickle.dumps(event.data)), event.datetime.isoformat(), event.message])
+
+        with closing(connection.cursor()) as cursor:
+            stream.seek(0)
+            cursor.copy_from(
+                file=stream,
+                table=Event._meta.db_table,
+                sep='\t',
+                columns=['group_id', 'project_id', 'message_id', 'data', 'datetime', 'message']
+            )
+
+        db_events = list(Event.objects.filter(event_id__in=[event.event_id for event, tags, mapping in events]))
+        events_map = {event.event_id: event for event in db_events}
+        new_events = []
+        for event, tags, mapping in events:
+            new_events.append((
+                events_map[event.event_id],
+                tags,
+                mapping
+            ))
+        events = new_events
+
+        keys = set()
+        key_to_tagkey = {}
+        for event, tags, mapping in events:
+            project_id = event.project_id
+
+            for key, value in tags:
+                keys.add(key)
+
+        for key in keys:
+            tagkey, _ = tagstore.get_or_create_tag_key(project_id, key)
+            key_to_tagkey[key] = tagkey
+
+        event_tags = []
+        for event, tags, mapping in events:
+            project_id = event.project_id
+
+            for key, value in tags:
+                tagvalue, _ = tagstore.get_or_create_tag_value(project_id, key, value)
+                event_tags.append(EventTag(
+                    project_id=project_id,
+                    group_id=event.group_id,
+                    event_id=event.id,
+                    key_id=key_to_tagkey[key].id,
+                    value_id=tagvalue.id,
+                ))
+            safe_execute(Group.objects.add_tags, event.group, tags, _with_transaction=False)
+
+        stream = StringIO()
+        writer = csv.writer(stream, delimiter='\t')
+
+        for tag in event_tags:
+            writer.writerow([tag.project_id, tag.group_id, tag.event_id, tag.key_id, tag.value_id, now__isoformat])
+
+        with closing(connection.cursor()) as cursor:
+            stream.seek(0)
+            cursor.copy_from(
+                file=stream,
+                table=EventTag._meta.db_table,
+                sep='\t',
+                columns=['project_id', 'group_id', 'event_id', 'key_id', 'value_id', 'date_added']
+            )
+
+        duration_end = time.time()
+        self.logger.info("EVENTS %s PERF: %s" % (count, count / (duration_end - duration_start),))
+
+    def save_item(self, data, project, raw=False):
         project = Project.objects.get_from_cache(id=project)
-
-        data = self.data.copy()
 
         # First we pull out our top-level (non-data attr) kwargs
         event_id = data.pop('event_id')
@@ -447,7 +549,6 @@ class EventManager(object):
         date = date.replace(tzinfo=timezone.utc)
 
         kwargs = {
-            'platform': platform,
         }
 
         event = Event(
@@ -463,7 +564,6 @@ class EventManager(object):
         # convert this to a dict to ensure we're only storing one value per key
         # as most parts of Sentry dont currently play well with multiple values
         tags = dict(data.get('tags') or [])
-        tags['level'] = LOG_LEVELS[level]
         if logger_name:
             tags['logger'] = logger_name
         if server_name:
@@ -503,13 +603,6 @@ class EventManager(object):
         # At this point we want to normalize the in_app values in case the
         # clients did not set this appropriately so far.
         normalize_in_app(data)
-
-        for plugin in plugins.for_project(project, version=None):
-            added_tags = safe_execute(plugin.get_tags, event, _with_transaction=False)
-            if added_tags:
-                # plugins should not override user provided tags
-                for key, value in added_tags:
-                    tags.setdefault(key, value)
 
         # tags are stored as a tuple
         tags = tags.items()
@@ -608,151 +701,7 @@ class EventManager(object):
         # store a reference to the group id to guarantee validation of isolation
         event.data.bind_ref(event)
 
-        try:
-            with transaction.atomic(using=router.db_for_write(EventMapping)):
-                EventMapping.objects.create(project=project, group=group, event_id=event_id)
-        except IntegrityError:
-            self.logger.info(
-                'duplicate.found',
-                exc_info=True,
-                extra={
-                    'event_uuid': event_id,
-                    'project_id': project.id,
-                    'group_id': group.id,
-                    'model': EventMapping.__name__,
-                }
-            )
-            return event
-
-        environment = Environment.get_or_create(
-            project=project,
-            name=environment,
-        )
-
-        if release:
-            ReleaseEnvironment.get_or_create(
-                project=project,
-                release=release,
-                environment=environment,
-                datetime=date,
-            )
-
-            grouprelease = GroupRelease.get_or_create(
-                group=group,
-                release=release,
-                environment=environment,
-                datetime=date,
-            )
-
-        counters = [
-            (tsdb.models.group, group.id),
-            (tsdb.models.project, project.id),
-        ]
-
-        if release:
-            counters.append((tsdb.models.release, release.id))
-
-        tsdb.incr_multi(counters, timestamp=event.datetime)
-
-        frequencies = [
-            # (tsdb.models.frequent_projects_by_organization, {
-            #     project.organization_id: {
-            #         project.id: 1,
-            #     },
-            # }),
-            # (tsdb.models.frequent_issues_by_project, {
-            #     project.id: {
-            #         group.id: 1,
-            #     },
-            # })
-            (tsdb.models.frequent_environments_by_group, {
-                group.id: {
-                    environment.id: 1,
-                },
-            })
-        ]
-
-        if release:
-            frequencies.append(
-                (tsdb.models.frequent_releases_by_group, {
-                    group.id: {
-                        grouprelease.id: 1,
-                    },
-                })
-            )
-
-        tsdb.record_frequency_multi(frequencies, timestamp=event.datetime)
-
-        UserReport.objects.filter(
-            project=project,
-            event_id=event_id,
-        ).update(group=group)
-
-        # save the event unless its been sampled
-        if not is_sample:
-            try:
-                with transaction.atomic(using=router.db_for_write(Event)):
-                    event.save()
-            except IntegrityError:
-                self.logger.info(
-                    'duplicate.found',
-                    exc_info=True,
-                    extra={
-                        'event_uuid': event_id,
-                        'project_id': project.id,
-                        'group_id': group.id,
-                        'model': Event.__name__,
-                    }
-                )
-                return event
-
-            index_event_tags.delay(
-                organization_id=project.organization_id,
-                project_id=project.id,
-                group_id=group.id,
-                event_id=event.id,
-                tags=tags,
-            )
-
-        if event_user:
-            tsdb.record_multi(
-                (
-                    (tsdb.models.users_affected_by_group, group.id, (event_user.tag_value, )),
-                    (tsdb.models.users_affected_by_project, project.id, (event_user.tag_value, )),
-                ),
-                timestamp=event.datetime
-            )
-
-        if is_new and release:
-            buffer.incr(
-                ReleaseProject, {'new_groups': 1}, {
-                    'release_id': release.id,
-                    'project_id': project.id,
-                }
-            )
-
-        safe_execute(Group.objects.add_tags, group, tags, _with_transaction=False)
-
-        if not raw:
-            if not project.first_event:
-                project.update(first_event=date)
-                first_event_received.send(project=project, group=group, sender=Project)
-
-            post_process_group.delay(
-                group=group,
-                event=event,
-                is_new=is_new,
-                is_sample=is_sample,
-                is_regression=is_regression,
-            )
-        else:
-            self.logger.info('post_process.skip.raw_event', extra={'event_id': event.id})
-
-        # TODO: move this to the queue
-        if is_regression and not raw:
-            regression_signal.send_robust(sender=Group, instance=group)
-
-        return event
+        return event, tags, EventMapping(project=project, group=group, event_id=event_id)
 
     def _get_event_user(self, project, data):
         user_data = data.get('sentry.interfaces.User')
@@ -799,6 +748,16 @@ class EventManager(object):
         return euser
 
     def _find_hashes(self, project, hash_list):
+        if len(hash_list) == 1:
+            try:
+                hash_obj = GroupHash(
+                    project=project,
+                    hash=hash_list[0],
+                )
+                hash_obj.save()
+            except IntegrityError:
+                hash_obj = GroupHash.objects.get_from_cache(project=project, hash=hash_list[0])
+            return [hash_obj]
         return map(
             lambda hash: GroupHash.objects.get_or_create(
                 project=project,
@@ -877,7 +836,7 @@ class EventManager(object):
             )
 
         else:
-            group = Group.objects.get(id=existing_group_id)
+            group = Group.objects.get_from_cache(id=existing_group_id)
 
             group_is_new = False
 
