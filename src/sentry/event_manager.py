@@ -7,16 +7,19 @@ sentry.event_manager
 """
 from __future__ import absolute_import, print_function
 
+import json
 import logging
 import math
 from contextlib import closing
 import csv
 from cStringIO import StringIO
+import time
 
 import six
 
+from redis import StrictRedis
 from datetime import datetime, timedelta
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from django.conf import settings
 from django.db import connection, IntegrityError, router, transaction
 from django.utils import timezone
@@ -412,16 +415,20 @@ class EventManager(object):
         return data
 
     def save(self, project, raw=False):
+        redis_db = StrictRedis.from_url(settings.BROKER_URL)
         import time
         duration_start = time.time()
         items = self.data
 
         events = []
 
+        inc_keys = defaultdict(int)
         count = len(items)
         for item in items:
             data = item.copy()
             events.append(self.save_item(data, project))
+            if 'counter' in data['extra']:
+                inc_keys[data['extra']['counter'].strip("'")] += 1
 
         # EventMapping.objects.bulk_create([mapping for event, tags, mapping in events])
 
@@ -509,6 +516,9 @@ class EventManager(object):
                 sep='\t',
                 columns=['project_id', 'group_id', 'event_id', 'key_id', 'value_id', 'date_added']
             )
+
+        for key, value in inc_keys.items():
+            redis_db.hincrby("loaded", key, value)
 
         duration_end = time.time()
         self.logger.info("EVENTS %s PERF: %s" % (count, count / (duration_end - duration_start),))

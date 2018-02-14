@@ -4,9 +4,11 @@ import base64
 import logging
 import six
 import traceback
-
 from time import time
 
+from redis import StrictRedis
+
+from collections import defaultdict
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.core.cache import cache
@@ -18,8 +20,11 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.generic.base import View as BaseView
 from functools import wraps
 from raven.contrib.django.models import client as Raven
+from rest_framework import permissions
+
 
 from sentry import quotas, tsdb
+from sentry.api.base import Endpoint
 from sentry.coreapi import (
     APIError, APIForbidden, APIRateLimited, ClientApiHelper, CspApiHelper, LazyData,
     MinidumpApiHelper,
@@ -271,6 +276,22 @@ class APIView(BaseView):
         return response
 
 
+class ProgressView(Endpoint):
+
+    permission_classes = (permissions.IsAuthenticated, )
+
+    def get(self, request, key):
+        redis_db = StrictRedis.from_url(settings.BROKER_URL)
+        sent = redis_db.hget('sent', key)
+        loaded = redis_db.hget('loaded', key)
+        return HttpResponse(
+            json.dumps({
+                'sent': sent,
+                'loaded': loaded,
+            }), content_type='application/json'
+        )
+
+
 class StoreView(APIView):
     """
     The primary endpoint for storing new events.
@@ -337,6 +358,7 @@ class StoreView(APIView):
         return response
 
     def process(self, request, project, key, auth, helper, data, **kwargs):
+        redis_db = StrictRedis.from_url(settings.BROKER_URL)
         metrics.incr('events.total')
         data_list = data
         if not data_list:
@@ -361,8 +383,12 @@ class StoreView(APIView):
         start_time = time()
         tsdb_start_time = to_datetime(start_time)
         events_ids = []
+
+        inc_keys = defaultdict(int)
         for data in data_list:
             event_id = data['event_id']
+            if 'counter' in data['extra']:
+                inc_keys[data['extra']['counter'].strip("'")] += 1
 
             tsdb.incr_multi(
                 [
@@ -384,6 +410,10 @@ class StoreView(APIView):
                     'An event with the same ID already exists (%s)' % (event_id, ))
 
             # mutates data (strips a lot of context if not queued)
+
+        for key, value in inc_keys.items():
+            redis_db.hincrby("sent", key, value)
+
         helper.insert_data_to_database(data_list, start_time=start_time)
 
         for data in data_list:
