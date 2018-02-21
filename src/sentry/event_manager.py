@@ -514,7 +514,8 @@ class EventManager(object):
         keys = set()
         key_to_tagkey = {}
         # All events are from the same project
-        project_id = events[0].project_id
+        event, tags, mapping = events[0]
+        project_id = event.project_id
         for event, tags, mapping in events:
 
             for key, value in tags:
