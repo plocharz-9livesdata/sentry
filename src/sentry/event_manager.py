@@ -741,6 +741,9 @@ class EventManager(object):
         # store a reference to the group id to guarantee validation of isolation
         event.data.bind_ref(event)
 
+        if not raw:
+            if not project.first_event:
+                project.update(first_event=date)
         return event, tags, EventMapping(project=project, group=group, event_id=event_id)
 
     def _get_event_user(self, project, data):
