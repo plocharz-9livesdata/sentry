@@ -24,6 +24,9 @@ from django.utils.encoding import force_bytes, force_text
 from hashlib import md5
 from uuid import uuid4
 
+from sentry.utils.compat import pickle
+from sentry.utils.strings import compress
+from sentry import tagstore
 from sentry import buffer, eventtypes, features, tsdb
 from sentry.constants import (
     CLIENT_RESERVED_ATTRS, LOG_LEVELS, LOG_LEVELS_MAP, DEFAULT_LOG_LEVEL,
@@ -48,6 +51,7 @@ from sentry.utils.safe import safe_execute, trim, trim_dict, get_path
 from sentry.utils.strings import truncatechars
 from sentry.utils.validators import is_float
 from sentry.stacktraces import normalize_in_app
+from sentry.tagstore.legacy.models.eventtag import EventTag
 
 
 HASH_RE = re.compile(r'^[0-9a-f]{32}$')
@@ -610,52 +614,52 @@ class EventManager(object):
 
         now__isoformat = timezone.now().isoformat()
         tuples = []
-        for event, tags, mapping in events:
+        for event, tags, mapping, environment in events:
             tuples.append((mapping.project_id, mapping.group.id, mapping.event_id, now__isoformat))
         copier = PgCopier(EventMapping._meta.db_table, connection)
         copier.copy_from_tuples(tuples, ['project_id', 'group_id', 'event_id', 'date_added'])
 
         tuples = []
-        for event, tags, mapping in events:
+        for event, tags, mapping, environment in events:
             message = event.message.decode("utf-8", errors="backslashreplace").encode("utf-8")
             tuples.append((message, event.group.id, event.project_id, event.event_id, compress(pickle.dumps(event.data)), event.datetime.isoformat()))
         copier = PgCopier(Event._meta.db_table, connection)
         copier.copy_from_tuples(tuples, ['message', 'group_id', 'project_id', 'message_id', 'data', 'datetime'])
 
         # Get events from db, as some fields are set after events are stored in db
-        db_events = list(Event.objects.filter(event_id__in=[event.event_id for event, tags, mapping in events]))
+        db_events = list(Event.objects.filter(event_id__in=[event.event_id for event, tags, mapping, environment in events]))
         events_map = {event.event_id: event for event in db_events}
         new_events = []
         # recreate events list, this time using Event instances from db
-        for event, tags, mapping in events:
+        for event, tags, mapping, environment in events:
             new_events.append((
                 events_map[event.event_id],
                 tags,
-                mapping
+                mapping,
+                environment
             ))
         events = new_events
 
         keys = set()
         key_to_tagkey = {}
         # All events are from the same project
-        event, tags, mapping = events[0]
+        event, tags, mapping, environment = events[0]
         project_id = event.project_id
-        for event, tags, mapping in events:
-
+        for event, tags, mapping, environment in events:
             for key, value in tags:
-                keys.add(key)
+                keys.add((environment.id, key))
 
         for key in keys:
             # This created O(n) queries, can be improved to run constant number of queries on db
-            tagkey, _ = tagstore.get_or_create_tag_key(project_id, key)
-            key_to_tagkey[key] = tagkey
+            tagkey, _ = tagstore.get_or_create_tag_key(project_id, *key)
+            key_to_tagkey[key[1]] = tagkey
 
         event_tags = []
-        for event, tags, mapping in events:
+        for event, tags, mapping, environment in events:
 
             for key, value in tags:
                 # This created O(n) queries, can be improved to run constant number of queries on db
-                tagvalue, _ = tagstore.get_or_create_tag_value(project_id, key, value)
+                tagvalue, _ = tagstore.get_or_create_tag_value(project_id, environment.id, key, value)
                 event_tags.append(EventTag(
                     project_id=project_id,
                     group_id=event.group_id,
@@ -663,7 +667,7 @@ class EventManager(object):
                     key_id=key_to_tagkey[key].id,
                     value_id=tagvalue.id,
                 ))
-            safe_execute(Group.objects.add_tags, event.group, tags, _with_transaction=False)
+            safe_execute(Group.objects.add_tags, event.group, environment, tags, _with_transaction=False)
 
         tuples = []
         for tag in event_tags:
@@ -688,7 +692,7 @@ class EventManager(object):
         try:
             event = Event.objects.get(
                 project_id=project.id,
-                event_id=self.data['event_id'],
+                event_id=data['event_id'],
             )
         except Event.DoesNotExist:
             pass
@@ -697,7 +701,7 @@ class EventManager(object):
                 'duplicate.found',
                 exc_info=True,
                 extra={
-                    'event_uuid': self.data['event_id'],
+                    'event_uuid': data['event_id'],
                     'project_id': project.id,
                     'model': Event.__name__,
                 }
@@ -916,10 +920,15 @@ class EventManager(object):
         # store a reference to the group id to guarantee validation of isolation
         event.data.bind_ref(event)
 
+        environment = Environment.get_or_create(
+            project=project,
+            name=environment,
+        )
+
         if not raw:
             if not project.first_event:
                 project.update(first_event=date)
-        return event, tags, EventMapping(project=project, group=group, event_id=event_id)
+        return event, tags, EventMapping(project=project, group=group, event_id=event_id), environment
 
     def _get_event_user(self, project, data):
         user_data = data.get('sentry.interfaces.User')

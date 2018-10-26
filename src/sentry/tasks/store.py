@@ -63,8 +63,11 @@ def _do_preprocess_event(cache_key, data, start_time, event_id, process_event):
         return
 
     if isinstance(data, dict):
+        project = data['project']
         data = [data]
-    save_event(data=data, start_time=start_time)
+    else:
+        project = data[0]['project']
+    save_event(data=data, start_time=start_time, project_id=project)
 
 
 @instrumented_task(

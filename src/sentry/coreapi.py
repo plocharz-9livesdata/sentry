@@ -498,9 +498,9 @@ class LazyData(MutableMapping):
         processed_data = []
         if isinstance(data, list):
             for item in data:
-                processed_data.append(self._process_item(auth, item, helper, project))
+                processed_data.append(self._process_item(auth, item, helper, self._project))
         else:
-            processed_data = [self._process_item(auth, data, helper, project)]
+            processed_data = [self._process_item(auth, data, helper, self._project)]
 
         self._data = processed_data
         self._decoded = True
